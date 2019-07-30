@@ -1,96 +1,83 @@
 #!/usr/bin/env python
-
-# In this exapmple we have a function `publish_every_2secs` publishing a
-# message every 2 senconds to topic `hopping_topic`
-# We have created an agent `print_windowed_events` consuming events from
-# `hopping_topic` that mutates the windowed table `values_table`
-
-# `values_table` is a table with hopping (overlaping) windows. Each of
-# its windows is 10 seconds of duration, and we create a new window every 5
-# seconds.
-# |----------|
-#       |-----------|
-#             |-----------|
-#                   |-----------|
-
-from random import random
-from datetime import timedelta
-import time
+import json
 import faust
-import statistics
-from types import SimpleNamespace
-from monasca_persister.repositories.utils import parse_measurement_message
+import pymysql
+from collections import defaultdict
+from datetime import timedelta
+
+ALARM_SQL = "select * from alarm_definition where deleted_at is NULL order by created_at"
+SUB_ALARM_SQL = """select sad.*, sadd.* from sub_alarm_definition sad 
+    left outer join sub_alarm_definition_dimension sadd on sadd.sub_alarm_definition_id=sad.id 
+    where sad.alarm_definition_id = '%s' order by sad.id"""
 
 app = faust.App('prototyping', broker='kafka://localhost:9092')
 
-#metric_topic = app.topic('metrics', value_serializer='raw', key_type=str)
 metric_topic = app.topic('metrics')
 
 
-
-
+tables = dict()
+alarms = []
+mapto = defaultdict(list)
 
 @app.agent(metric_topic)
 async def print_metrics(stream):
-    async for msg in stream:
+    global mapto
+    async for event in stream.events():
         try:
-            decoded_message = msg
+            decoded_message = json.loads(event.message.value)
             metric = decoded_message['metric']
             metric_name = metric['name']
-            region = decoded_message['meta']['region']
-            tenant_id = decoded_message['meta']['tenantId']
-            time_stamp = metric['timestamp']
-            value = float(metric['value'])
-            value_meta = metric.get('value_meta', {})
-            value_meta = {} if value_meta is None else value_meta
             dimensions = metric.get('dimensions', {})
-
-            print(f"{time.ctime(time_stamp/1000)} {metric_name}, {dimensions}")
+            for dim in dimensions.items():
+                al = mapto.get((metric_name, dim), None)
+                if al:
+                    await event.forward(handle_alarm_metrics)
         except Exception as e:
             print('*'*80)
-            print(msg)
+            print(e)
             print('*'*80)
-    
 
 
-#TOPIC = 'hopping_topic'
-#WINDOW_SIZE = 10
-#WINDOW_STEP = 5
-#
-#hopping_topic = app.topic(TOPIC, value_type=Model)
-#values_table = app.Table(
-#    'values_table',
-#    default=list
-#).hopping(WINDOW_SIZE, WINDOW_STEP, expires=timedelta(minutes=10))
+@app.agent()
+async def handle_alarm_metrics(metrics):
+    async for msg in metrics:
+        print(msg)
+
+@app.agent(app.topic('events'))
+async def handle_alarm_definitions(stream):
+    async for msg in stream:
+        if 'alarm-definition-created' in msg.keys():
+            pass
+        elif 'alarm-definition-deleted' in msg.keys():
+            pass
+        elif 'alarm-definition-updated' in msg.keys():
+            pass
 
 
-#@app.agent(hopping_topic)
-#async def print_windowed_events(stream):
-#    async for event in stream:  # noqa
-#        values_table['values'] += [event.random]
-#        values = values_table['values'].delta(WINDOW_SIZE)
-#        print(f'-- New Event (every 2 secs) written to hopping(10, 5) --')
-#        print(f'COUNT should start at 0 and after 10 secs be 5: '
-#              f'{len(values)}')
-#        print(f'SUM   should have values between 0-5: '
-#              f'{sum(values) if values else 0}')
-#        print(f'AVG   should have values between 0-1: '
-#              f'{statistics.mean(values) if values else 0}')
-#        print(f'LAST  should have values between 0-1: '
-#              f'{event.random}')
-#        print(f'MAX   should have values between 0-1: '
-#              f'{max(values) if values else 0}')
-#        print(f'MIN   should have values between 0-1: '
-#              f'{min(values) if values else 0}')
+@app.task
+async def create_infra():
+    global alarms, mapto
+    connection = pymysql.connect('127.0.0.1', 'root', 'secretdatabase', 'mon')
+    cursor = connection.cursor(pymysql.cursors.DictCursor)
+    cursor.execute(ALARM_SQL)
+    alarms += cursor.fetchall()
 
-#counter=0
-#@app.timer(2.0, on_leader=True)
-#async def publish_every_2secs():
-#    global counter
-#    counter+=1
-#    msg = f'counter {counter}'
-#    await metric_topic.send(value=msg)
-
+    for al in alarms:
+        al['seen'] = False
+        cursor.execute(SUB_ALARM_SQL % al['id'])
+        al['subexpression'] = cursor.fetchall()
+        for subexpr in al['subexpression']:
+            hsh = (subexpr['metric_name'], (subexpr['dimension_name'],subexpr['value']))
+            mapto[hsh] += al
+            
+        #await al['topic'].maybe_declare()
+#            WINDOW_SIZE = subexpr['period'] * subexpr['periods']
+#            WINDOW_SIZE = 1
+#            metric_table = app.Table(
+#                subexpr['metric_name'],
+#                default=list
+#            ).hopping(WINDOW_SIZE, WINDOW_STEP, expires=timedelta(minutes=10))
+#            tables[metric_name] = metric_table
 
 if __name__ == '__main__':
     app.main()

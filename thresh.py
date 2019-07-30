@@ -29,8 +29,8 @@ async def print_metrics(stream):
             metric_name = metric['name']
             dimensions = metric.get('dimensions', {})
             for dim in dimensions.items():
-                al = mapto.get((metric_name, dim), None)
-                if al:
+                als = mapto.get((metric_name, dim), None)
+                if als:
                     await event.forward(handle_alarm_metrics)
         except Exception as e:
             print('*'*80)
@@ -70,14 +70,6 @@ async def create_infra():
             hsh = (subexpr['metric_name'], (subexpr['dimension_name'],subexpr['value']))
             mapto[hsh] += al
             
-        #await al['topic'].maybe_declare()
-#            WINDOW_SIZE = subexpr['period'] * subexpr['periods']
-#            WINDOW_SIZE = 1
-#            metric_table = app.Table(
-#                subexpr['metric_name'],
-#                default=list
-#            ).hopping(WINDOW_SIZE, WINDOW_STEP, expires=timedelta(minutes=10))
-#            tables[metric_name] = metric_table
 
 if __name__ == '__main__':
     app.main()

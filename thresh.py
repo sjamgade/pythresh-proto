@@ -31,11 +31,24 @@ async def print_metrics(stream):
             for dim in dimensions.items():
                 al = mapto.get((metric_name, dim), None)
                 if al:
-                    await event.forward(handle_alarm_metrics)
+                    key = (metric_name, dim)
+                    measure = f'{metric_name}-{dim[0]}-{dim[1]}'
+                    await handle_table_creation.send(key=measure, value=event.message.value)
+                    await handle_alarm_metrics.send(value=event.message.value)
         except Exception as e:
             print('*'*80)
             print(e)
             print('*'*80)
+
+@app.agent()
+async def handle_table_creation(measurements):
+    async for key,value in measurements.items():
+        if key not in tables.keys():
+
+            tables[key] = app.Table(key, default=list)
+            print(f'{tbname} created succsessfully')
+            
+
 
 
 @app.agent()

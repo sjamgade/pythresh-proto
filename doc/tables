@@ -1,0 +1,21 @@
+Metrics
+ * name
+ * tenantID
+ * dimensions
+ * (alarm definition, alarm) tuples
+
+Alarm Definitions
+ * alarm expression
+ * tenantID
+ * metric names
+ * match_by dimensions
+ * alarms
+
+Alarms
+ * tenantID
+ * alarm definition
+ * metrics
+ ** match_by dimensions
+ * values
+ * aggregation function
+ * state

@@ -1,0 +1,35 @@
+diff --git a/tables/recovery.py b/tables/recovery.py
+index 1f6f232..d2d6eda 100644
+--- a/tables/recovery.py
++++ b/tables/recovery.py
+@@ -245,6 +245,7 @@ class Recovery(Service):
+         await app._fetcher.maybe_start()
+         self.tables.on_actives_ready()
+         self.tables.on_standbys_ready()
++        self.tables._recovery_started.clear()
+         app.on_rebalance_end()
+         self.log.info('Worker ready')
+ 
+@@ -476,6 +477,7 @@ class Recovery(Service):
+             self.tables.on_standbys_ready()
+         self.app.on_rebalance_end()
+         self.log.info('Worker ready')
++        self.tables._recovery_started.clear()
+ 
+     async def _build_highwaters(self,
+                                 consumer: ConsumerT,
+diff --git a/transport/drivers/aiokafka.py b/transport/drivers/aiokafka.py
+index 53cb7a8..22b0a3e 100644
+--- a/transport/drivers/aiokafka.py
++++ b/transport/drivers/aiokafka.py
+@@ -407,6 +407,10 @@ class AIOKafkaConsumerThread(ConsumerThread):
+         """Return the last offsets for a list of partitions."""
+         return await self.call_thread(self._highwaters, partitions)
+ 
++    def request_rejoin(self, *partitions: TP) -> Mapping[TP, int]:
++        """Return the last offsets for a list of partitions."""
++        return self._consumer._coordinator.request_rejoin()
++
+     async def _highwaters(self, partitions: List[TP]) -> Mapping[TP, int]:
+         consumer = self._ensure_consumer()
+         if self.consumer.in_transaction:

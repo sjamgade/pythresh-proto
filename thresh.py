@@ -1,14 +1,31 @@
 #!/usr/bin/env python
-import sys
+
+# Create
+# monasca alarm-definition-create test "cpu.percent{hostname=ubuntu}>50}
+# monasca alarm-definition-create test1 "cpu.percent{hostname=opensuse}>50}
+
+# RUN:
+# faust -A thresh worker -l info
+
+# OBSERVE:
+# kafkacat -C -b localhost -t prototyping-subexprs_states-changelog
+
+# CREATE LOAD
+#  dd if=/dev/urandom | bzip2 -9 >> /dev/null
+
+
+
 import faust
 import pymysql
+
 from collections import defaultdict
 from datetime import timedelta
-from typing import (
-        Any,
-        Dict,
-        Optional
-        )
+from datetime import datetime as dt
+from itertools import takewhile
+import traceback
+from typing import (Any,
+                    Dict,
+                    Optional)
 
 #def infinite_dd():
 #    return defaultdict(infinite_dd)
@@ -40,39 +57,82 @@ class Message(faust.Record, serializer='json'):
     metric: MetricT
 
 
+class SubExpr(faust.Record, serializer='json'):
+    sid: str
+    timestamp: float
+
 # mapto[tenantid][metricname][subalrmid]
-# = set(
 mapto = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
-subalmsmap = dict() #mapping from subalarmid to alarmname
+als = dict()
+subals = dict()
 metric_topic = app.topic('metrics', value_type=Message)
-WINDOW_SIZE = 10
+WINDOW_SIZE = 300
 WINDOW_STEP = 5
-tenantsTable = app.Table('hugeTable', default=list).hopping(WINDOW_SIZE, WINDOW_STEP, expires=timedelta(minutes=10))
+measures_table = app.Table('measures', default=list, partitions=64).hopping(WINDOW_SIZE, WINDOW_STEP, expires=timedelta(minutes=10))
+subexprs_table = app.Table('subexprs_states', default=False, partitions=64)
+FUNCTIONMAP = {
+        'SUM':sum,
+        'MAX':max,
+        'MIN':min,
+        }
+
+def threshold(operator, lhs, rhs):
+    if operator == 'LT':
+        return lhs < rhs
+    elif operator == 'LTE':
+        return lhs <= rhs
+    elif operator == 'GT':
+        return lhs > rhs
+    elif operator == 'GTE':
+        return lhs >= rhs
+    else:
+        return False
+
 
 @app.agent(metric_topic)
 async def print_metrics(stream):
     global mapto
-    async for event in stream.group_by(Message.meta.tenantId):
+    async for event in stream.group_by(Message.meta.tenantId, partitions=64):
         try:
-#            decoded_message = json.loads(event.message.value)
-            metric = event.metric
-            dimensions = metric.dimensions
-            recvd = set(dimensions.items())
-            needed = mapto[event.meta.tenantId].get(metric.name, {})
-            fitting = False
-            for subalm, dimset in needed.items():
+            recvd = set(event.metric.dimensions.items())
+            needed = mapto[event.meta.tenantId].get(event.metric.name, {})
+            for sid, dimset in needed.items():
                 if dimset & recvd == dimset:
-                    tenantsTable[subalm] += [event.metric]
-                    alname = subalmsmap[subalm]
-                    print(f'need {event.metric.name} with {event.metric.dimensions} from {dimset} for {alname} {subalm}')
-                    fitting = True
-            if not fitting and needed :
-                print(f'{needed.values()} not in {recvd} with {event.metric.name}')
+                    existing = measures_table[sid].now()
+                    event.metric.timestamp /= 1000
+                    measures_table[sid] = [event.metric] + existing
+                    evaluator(sid)
         except Exception as e:
             print('*'*80)
-            print(e)
-            raise e
+            traceback.print_exc()
             print('*'*80)
+
+
+def getValuesTrimmedToPeriod(sbexpr):
+    now = dt.now().timestamp()
+
+    def withintperiod(measure):
+        return (now - measure.timestamp) < sbexpr['period']
+
+    values = takewhile(withintperiod, measures_table[sbexpr['id']].now())
+    return map(lambda m: m.value, values)
+
+
+def evaluator(sid):
+    aid = subals[sid]
+    sbexpr = als[aid]['subexpressions'][sid]
+    values = getValuesTrimmedToPeriod(sbexpr)
+    values = list(values)
+
+    try:
+        res = FUNCTIONMAP[sbexpr['function']](values)
+    except Exception as e:
+        traceback.print_exc()
+        return
+    state = threshold(sbexpr['operator'], res, sbexpr['threshold'])
+
+    print(f'{aid}: {sbexpr["function"]}({values}) {sbexpr["operator"]} {sbexpr["threshold"]} {state}')
+    subexprs_table[sbexpr['id']] = state
 
 
 @app.agent(app.topic('events'))
@@ -88,38 +148,40 @@ async def handle_alarm_definitions(stream):
 
 @app.task
 async def create_infra():
-    global mapto
+    global mapto, subals, als
     connection = pymysql.connect('127.0.0.1', 'root', 'secretdatabase', 'mon')
     cursor = connection.cursor(pymysql.cursors.DictCursor)
     cursor.execute(ALARM_SQL)
+    alarms = cursor.fetchall()
     
-
-    for al in cursor.fetchall():
-        #mapto[al['tenant_id']] = defaultdict()
-        al['seen'] = False
+    for al in alarms:
         cursor.execute(SUB_ALARM_SQL % al['id'])
-        al['subexpression'] = cursor.fetchall()
-        for subexpr in al['subexpression']:
-            subalms = mapto[al['tenant_id']][subexpr['metric_name']]
-            if subexpr['dimension_name']:
-                dim = (subexpr['dimension_name'],subexpr['value'])
-                subalms[subexpr['id']].add(dim)
+        aid = al['id']
+        als[aid] = al
+        als[aid]['subexpressions'] = {}
+        sbexprs = cursor.fetchall()
+        for sbexpr in sbexprs:
+            sid = sbexpr['id']
+            als[aid]['subexpressions'][sid] = sbexpr
+            subals[sid] = aid
+            # metric A is needed with dimensions (B=C) and (D=E)
+            # so make a set {(B,C),(D=E)} for each sbexpr.
+            # For better perf this mapping can be reversed into a dict,
+            # dict[metric.name][frozenset {(B,C),(D=E)}] = [sid]
+            # dict[metric.name][frozenset {(B,X),(D=Y)}] = [sid]
+            sbalm2dimset = mapto[al['tenant_id']][sbexpr['metric_name']]
+            if sbexpr['dimension_name']:
+                dim = (sbexpr['dimension_name'],sbexpr['value'])
+            # sub_alarm_definition_id is derived from
+            # sub_alarm_definition_dimension table, which might not have
+            # an entry for some subexpression if there is no
+            # dimension defined on the metric
+                sbalm2dimset[sid].add(dim)
             else:
                 # metric without dimensions
-                _ = subalms[subexpr['id']]
+                _ = sbalm2dimset[sid]
                 # just get the id so an empty set is added
                 # set() & set(<anything>) == set() 
-            # sub_alarm_definition_id is derived from sub_alarm_definition_dimension table, which might not have
-            # an entry for some subexpression if there
-            # is no dimension defined on the metric
-            subalmsmap[subexpr['id']] = al['name']
-            
-            #mapto[al['tenant_id']][subexpr['metric_name']].update(subalms)
-
-    for i in mapto[al['tenant_id']]:
-        print(i)
-        print(mapto[al['tenant_id']][i])
-        
             
 
 if __name__ == '__main__':

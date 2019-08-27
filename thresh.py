@@ -38,6 +38,11 @@ SUB_ALARM_SQL = """select sad.*, sadd.* from sub_alarm_definition sad
 app = faust.App('prototyping', broker='kafka://localhost:9092')
 
 
+class SmallMetricT(faust.Record, serializer='json'):
+    timestamp: float
+    value: float
+
+
 class MetricT(faust.Record, serializer='json'):
     name: str
     value_meta: Any
@@ -57,24 +62,60 @@ class Message(faust.Record, serializer='json'):
     metric: MetricT
 
 
-class SubExpr(faust.Record, serializer='json'):
-    sid: str
-    timestamp: float
-
 # mapto[tenantid][metricname][subalrmid]
 mapto = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
 als = dict()
 subals = dict()
 metric_topic = app.topic('metrics', value_type=Message)
-WINDOW_SIZE = 300
-WINDOW_STEP = 5
-measures_table = app.Table('measures', default=list, partitions=64).hopping(WINDOW_SIZE, WINDOW_STEP, expires=timedelta(minutes=10))
+QUEUE_SIZE = 300
+measures_table = app.Table('measures', default=list, partitions=64)
 subexprs_table = app.Table('subexprs_states', default=False, partitions=64)
-FUNCTIONMAP = {
-        'SUM':sum,
-        'MAX':max,
-        'MIN':min,
-        }
+FUNCTIONMAP = { 'SUM':sum, 'MAX':max, 'MIN':min }
+
+
+@app.agent(metric_topic)
+async def print_metrics(stream):
+    global mapto
+    async for event in stream.group_by(Message.meta.tenantId, partitions=64):
+        try:
+            recvd = set(event.metric.dimensions.items())
+            needed = mapto[event.meta.tenantId].get(event.metric.name, {})
+            for sid, dimset in needed.items():
+                if dimset & recvd == dimset:
+                    curr = SmallMetricT(timestamp=event.metric.timestamp/1000,
+                                        value=event.metric.value)
+
+                    values = measures_table[sid] 
+                    values.insert(0, curr)
+                    # ....................  <- measures
+                    #    |take everything|
+                    #  q_size           now <- timestamps
+                    after = dt.now().timestamp() - QUEUE_SIZE
+                    # take values whose have timestamp greater than (now-QUEUE_SIZE)
+                    try:
+                        values = list(takewhile(lambda m: after < m.timestamp, values))
+                    except:
+                        def loads(m):
+                            if isinstance(m,dict) and "__faust" in m.keys():
+                                return faust.Record.loads(m)
+                            return m
+                        values = list(map(loads, values))
+                        values = list(takewhile(lambda m: after < m.timestamp, values))
+                    measures_table[sid] = values
+
+#                    vals = measures_table[sid]
+#                    try:
+#                        print(vals[0].timestamp - vals[-1].timestamp)
+#                        print(len(vals))
+#                    except:
+#                        print(vals)
+#                        raise
+#                    print((existing))
+                    evaluator(sid)
+        except Exception as e:
+            print('*'*80)
+            traceback.print_exc()
+            print('*'*80)
 
 def threshold(operator, lhs, rhs):
     if operator == 'LT':
@@ -89,32 +130,9 @@ def threshold(operator, lhs, rhs):
         return False
 
 
-@app.agent(metric_topic)
-async def print_metrics(stream):
-    global mapto
-    async for event in stream.group_by(Message.meta.tenantId, partitions=64):
-        try:
-            recvd = set(event.metric.dimensions.items())
-            needed = mapto[event.meta.tenantId].get(event.metric.name, {})
-            for sid, dimset in needed.items():
-                if dimset & recvd == dimset:
-                    existing = measures_table[sid].now()
-                    event.metric.timestamp /= 1000
-                    measures_table[sid] = [event.metric] + existing
-                    evaluator(sid)
-        except Exception as e:
-            print('*'*80)
-            traceback.print_exc()
-            print('*'*80)
-
-
 def getValuesTrimmedToPeriod(sbexpr):
-    now = dt.now().timestamp()
-
-    def withintperiod(measure):
-        return (now - measure.timestamp) < sbexpr['period']
-
-    values = takewhile(withintperiod, measures_table[sbexpr['id']].now())
+    since = dt.now().timestamp() - sbexpr['period']
+    values = takewhile(lambda m: since < m.timestamp, measures_table[sbexpr['id']])
     return map(lambda m: m.value, values)
 
 
